@@ -43,7 +43,12 @@ export default function SortDiagram({ merchant, rules, txn, gateways, simOverrid
 
   // Run simulation to get scored terminals
   const simResult = useMemo(() => {
-    return simulateRoutingPipeline(merchant, txn, rules, simOverrides)
+    try {
+      return simulateRoutingPipeline(merchant, txn, rules, simOverrides)
+    } catch (e) {
+      console.error('Sort simulation error:', e)
+      return { stages: [], isNTF: true, selectedTerminal: null, warnings: [e.message], routingStrategy: 'success_rate' }
+    }
   }, [merchant, txn, rules, simOverrides])
 
   const scoredTerminals = useMemo(() => simResult.stages?.find(s => s.type === 'sorter')?.scored || [], [simResult])

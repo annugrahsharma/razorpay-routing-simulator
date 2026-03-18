@@ -49,7 +49,12 @@ export default function FilterDiagram({ merchant, rules, txn, gateways, simOverr
 
   // Run simulation to determine which terminals are blocked
   const simResult = useMemo(() => {
-    return simulateRoutingPipeline(merchant, txn, rules, simOverrides)
+    try {
+      return simulateRoutingPipeline(merchant, txn, rules, simOverrides)
+    } catch (e) {
+      console.error('Pipeline simulation error:', e)
+      return { stages: [], isNTF: true, selectedTerminal: null, warnings: [e.message] }
+    }
   }, [merchant, txn, rules, simOverrides])
 
   // Determine which terminals are eliminated (door closed)
@@ -57,8 +62,10 @@ export default function FilterDiagram({ merchant, rules, txn, gateways, simOverr
     const result = {}
     terminals.forEach(t => { result[t.terminalId] = { open: true, reason: '' } })
 
+    const stages = simResult?.stages || []
+
     // Check pool elimination (method support)
-    const poolStage = simResult.stages.find(s => s.type === 'initial')
+    const poolStage = stages.find(s => s.type === 'initial')
     if (poolStage) {
       (poolStage.terminalsEliminated || []).forEach(t => {
         result[t.terminalId] = { open: false, reason: t.reason || 'Not eligible' }
@@ -66,7 +73,7 @@ export default function FilterDiagram({ merchant, rules, txn, gateways, simOverr
     }
 
     // Check rule eliminations
-    simResult.stages.forEach(s => {
+    stages.forEach(s => {
       if (s.type === 'rule_filter' || s.type === 'rule_ntf') {
         (s.terminalsEliminated || []).forEach(t => {
           if (result[t.terminalId]?.open) {
@@ -79,7 +86,7 @@ export default function FilterDiagram({ merchant, rules, txn, gateways, simOverr
     return result
   }, [terminals, simResult])
 
-  const isNTF = simResult.isNTF
+  const isNTF = simResult?.isNTF
   const openCount = Object.values(doorState).filter(d => d.open).length
 
   // ── Y Layout ──

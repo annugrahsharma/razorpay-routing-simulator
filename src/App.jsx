@@ -1,9 +1,23 @@
 import React, { useState, useMemo, useCallback } from 'react'
-import GaltonBoard from './GaltonBoard'
 import FilterDiagram from './FilterDiagram'
 import SortDiagram from './SortDiagram'
 import PaymentForm from './PaymentForm'
 import { merchants, gateways, generateSeedRules, simulateRoutingPipeline } from './data'
+
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null } }
+  static getDerivedStateFromError(error) { return { error } }
+  render() {
+    if (this.state.error) {
+      return React.createElement('div', { style: { padding: 20, color: '#dc2626', background: '#fef2f2', borderRadius: 8, margin: 16 } },
+        React.createElement('strong', null, 'Error: '),
+        this.state.error.message,
+        React.createElement('button', { onClick: () => this.setState({ error: null }), style: { marginLeft: 12, padding: '4px 12px', cursor: 'pointer' } }, 'Retry')
+      )
+    }
+    return this.props.children
+  }
+}
 
 export default function App() {
   const [selectedMerchantId, setSelectedMerchantId] = useState(merchants[0].id)
@@ -108,24 +122,26 @@ export default function App() {
 
           {/* Diagram */}
           <div className="viz-content">
-            {vizTab === 'filter' ? (
-              <FilterDiagram
-                merchant={merchant}
-                rules={rules}
-                txn={txn}
-                gateways={gateways}
-                simOverrides={simOverrides}
-                onToggleRule={handleToggleRule}
-              />
-            ) : (
-              <SortDiagram
-                merchant={merchant}
-                rules={rules}
-                txn={txn}
-                gateways={gateways}
-                simOverrides={simOverrides}
-              />
-            )}
+            <ErrorBoundary>
+              {vizTab === 'filter' ? (
+                <FilterDiagram
+                  merchant={merchant}
+                  rules={rules}
+                  txn={txn}
+                  gateways={gateways}
+                  simOverrides={simOverrides}
+                  onToggleRule={handleToggleRule}
+                />
+              ) : (
+                <SortDiagram
+                  merchant={merchant}
+                  rules={rules}
+                  txn={txn}
+                  gateways={gateways}
+                  simOverrides={simOverrides}
+                />
+              )}
+            </ErrorBoundary>
           </div>
         </div>
       </div>
