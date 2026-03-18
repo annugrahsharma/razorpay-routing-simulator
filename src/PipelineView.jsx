@@ -1,21 +1,24 @@
 import React, { useMemo, useEffect, useRef, useState } from 'react'
 import { gateways } from './data'
 
+// ── Layout ──
 const W = 760
-const PIPE_LEFT = 80
+const PIPE_LEFT = 90
 const PIPE_RIGHT = W - 30
-const PIPE_THICKNESS = 28
-const HOLE_R = 16           // hole radius — big, clickable
-const DROP_ZONE_H = 100     // vertical space for drop lines
-const PIPE_SLOPE_DROP = 80  // vertical drop across the pipe width (~15° visual angle)
-const TIER_SPACING = 30     // vertical gap between pipe tiers
-const SOURCE_R = 20
-const BIN_H = 68
-const SORTER_H = 65
-const THRESHOLD_H = 55
+const PIPE_THICKNESS = 32
+const PIPE_SLOPE_DROP = 70
+const TIER_SPACING = 50      // gap between pipe tiers (room for ejected chips)
+const CHIP_R = 14            // terminal chip radius
+const HOLE_R = 17            // hole clickable area
+const EJECT_DROP = 32        // how far ejected chips fall below pipe
+const SORTER_H = 90
+const RANK_CHIP_H = 36
+
+// Terminal color palette
+const CHIP_COLORS = ['#3b82f6', '#8b5cf6', '#06b6d4', '#f59e0b', '#ef4444', '#10b981', '#ec4899', '#6366f1']
 
 function getTerminalInfo(merchant, gw) {
-  return merchant.gatewayMetrics.map(gm => {
+  return merchant.gatewayMetrics.map((gm, i) => {
     const gateway = gw.find(g => g.id === gm.gatewayId)
     const term = gateway?.terminals.find(t => t.id === gm.terminalId)
     return {
@@ -26,6 +29,7 @@ function getTerminalInfo(merchant, gw) {
       costPerTxn: gm.costPerTxn,
       supportedMethods: gm.supportedMethods || [],
       isZeroCost: gm.costPerTxn === 0,
+      color: CHIP_COLORS[i % CHIP_COLORS.length],
     }
   })
 }
@@ -38,25 +42,20 @@ export default function PipelineView({
   const colCount = terminals.length
   const pipeW = PIPE_RIGHT - PIPE_LEFT
 
-  // Hole X positions — evenly spaced along the pipe
-  const holeXs = terminals.map((_, ci) => PIPE_LEFT + pipeW * (ci + 0.5) / colCount)
-
   // Extract stages
   const poolStage = pipelineResult?.stages?.find(s => s.type === 'initial')
   const ruleStages = pipelineResult?.stages?.filter(s =>
     s.type === 'rule_filter' || s.type === 'rule_ntf' || s.type === 'rule_skip' || s.type === 'rule_pass' || s.type === 'rule_disabled'
   ) || []
-  const thresholdStage = pipelineResult?.stages?.find(s => s.type === 'threshold_filter' || s.type === 'threshold_bypass')
   const sorterStage = pipelineResult?.stages?.find(s => s.type === 'sorter')
   const isNTF = pipelineResult?.isNTF
-  const selectedTerminalId = pipelineResult?.selectedTerminal?.terminalId
-  const selectedColIdx = terminals.findIndex(t => t.terminalId === selectedTerminalId)
 
   const eliminatedAfterPool = useMemo(() => {
     if (!poolStage) return new Set()
     return new Set((poolStage.terminalsEliminated || []).map(t => t.terminalId))
   }, [poolStage])
 
+  // Per-rule cumulative elimination
   const eliminatedAtRule = useMemo(() => {
     const result = []
     let cumulative = new Set(eliminatedAfterPool)
@@ -71,111 +70,146 @@ export default function PipelineView({
 
   const eliminatedAfterRules = eliminatedAtRule.length > 0 ? eliminatedAtRule[eliminatedAtRule.length - 1] : new Set(eliminatedAfterPool)
 
-  const eliminatedAfterThreshold = useMemo(() => {
-    const elim = new Set(eliminatedAfterRules)
-    if (thresholdStage) {
-      (thresholdStage.terminalsEliminated || []).forEach(t => elim.add(t.terminalId))
-    }
-    return elim
-  }, [eliminatedAfterRules, thresholdStage])
-
   // ── Y layout ──
-  const sourceY = 30
   const tierCount = Math.max(ruleStages.length, 1)
-  const tierTotalH = PIPE_THICKNESS + PIPE_SLOPE_DROP
-  const rulesBlockY = sourceY + SOURCE_R * 2 + 30
-  const rulesBlockEndY = rulesBlockY + tierCount * (tierTotalH + TIER_SPACING)
-  const termLabelY = rulesBlockEndY + 10
-  const thresholdY = termLabelY + 30
-  const sorterY = thresholdY + THRESHOLD_H + 20
-  const binY = sorterY + SORTER_H + 20
-  const totalH = binY + BIN_H + 20
+  const tierFullH = PIPE_THICKNESS + PIPE_SLOPE_DROP + TIER_SPACING
+  const sourceY = 30
+  const chipsStartY = sourceY + 50 // initial chip lineup
+  const pipeBlockY = chipsStartY + 50
+  const pipeBlockEndY = pipeBlockY + tierCount * tierFullH
+  const sorterY = pipeBlockEndY + 40
+  const rankY = sorterY + SORTER_H + 20
+  const scoredTerminals = sorterStage?.scored || []
+  const rankBlockH = Math.max(scoredTerminals.length, 1) * (RANK_CHIP_H + 6) + 20
+  const totalH = rankY + rankBlockH + 20
 
-  // Hole Y position on the tilted pipe at a given X
-  const holeYOnPipe = (tierIdx, holeX) => {
-    const tierBaseY = rulesBlockY + tierIdx * (tierTotalH + TIER_SPACING)
-    const progress = (holeX - PIPE_LEFT) / pipeW
-    return tierBaseY + PIPE_THICKNESS / 2 + progress * PIPE_SLOPE_DROP
+  // Hole positions along pipe
+  const holeXs = terminals.map((_, ci) => PIPE_LEFT + pipeW * (ci + 0.5) / colCount)
+
+  // Y on tilted pipe at given X
+  const pipeYAt = (tierIdx, x) => {
+    const tierBaseY = pipeBlockY + tierIdx * tierFullH
+    const progress = (x - PIPE_LEFT) / pipeW
+    return tierBaseY + progress * PIPE_SLOPE_DROP
   }
 
-  // ── Ball animation ──
-  const [ballProgress, setBallProgress] = useState(-1)
-  const animTimerRef = useRef(null)
-  const trailRef = useRef([])
+  // ── Animation ──
+  const [animProgress, setAnimProgress] = useState(-1)
+  const animRef = useRef(null)
 
   useEffect(() => {
     if (!pipelineResult || animKey === 0) return
-    setBallProgress(0)
-    trailRef.current = []
+    setAnimProgress(0)
     let start = null
-    const duration = 4500
-
+    const duration = 5000
     const tick = (ts) => {
       if (!start) start = ts
       const pct = Math.min((ts - start) / duration, 1)
-      setBallProgress(pct)
+      setAnimProgress(pct)
       const stageCount = pipelineResult.stages.length
       onStageReached(Math.min(Math.floor(pct * stageCount), stageCount - 1))
-      if (pct < 1) animTimerRef.current = requestAnimationFrame(tick)
+      if (pct < 1) animRef.current = requestAnimationFrame(tick)
     }
-    animTimerRef.current = requestAnimationFrame(tick)
-    return () => { if (animTimerRef.current) cancelAnimationFrame(animTimerRef.current) }
+    animRef.current = requestAnimationFrame(tick)
+    return () => { if (animRef.current) cancelAnimationFrame(animRef.current) }
   }, [animKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Ball follows tilted pipe L→R then drops through hole
-  const ballPos = useMemo(() => {
-    if (ballProgress < 0 || !pipelineResult) return null
-    const p = ballProgress
-    const dropX = selectedColIdx >= 0 ? holeXs[selectedColIdx] : PIPE_RIGHT
+  // Chip positions per terminal during animation
+  const chipPositions = useMemo(() => {
+    if (animProgress < 0 || !pipelineResult) return null
+    const p = animProgress
 
-    if (p < 0.06) {
-      // Drop from source to first pipe
-      const t = p / 0.06
-      const startY = sourceY + SOURCE_R
-      const endY = rulesBlockY + PIPE_THICKNESS / 2
-      return { x: PIPE_LEFT - 8, y: startY + t * (endY - startY) }
-    } else if (p < 0.55) {
-      // Roll L→R along the tilted pipe
-      const t = (p - 0.06) / 0.49
-      const x = PIPE_LEFT + t * (dropX - PIPE_LEFT)
-      // Follow the pipe slope
-      const lastTier = Math.min(Math.floor(t * tierCount), tierCount - 1)
-      const y = holeYOnPipe(lastTier, x)
-      // Small bounce on the pipe
-      const bounce = Math.sin(t * Math.PI * 8) * 3
-      return { x, y: y + bounce }
-    } else if (p < 0.68) {
-      // Drop through hole — gravity acceleration
-      const t = (p - 0.55) / 0.13
-      const dropStartY = holeYOnPipe(tierCount - 1, dropX) + HOLE_R
-      const dropEndY = thresholdY
-      const eased = t * t // gravity feel
-      return { x: dropX, y: dropStartY + eased * (dropEndY - dropStartY) }
-    } else if (p < 0.78) {
-      // Through threshold
-      const t = (p - 0.68) / 0.10
-      return { x: dropX, y: thresholdY + t * THRESHOLD_H }
-    } else if (p < 0.88) {
-      // Through sorter
-      const t = (p - 0.78) / 0.10
-      return { x: dropX, y: sorterY + t * SORTER_H }
-    } else {
-      // Into bin
-      const t = (p - 0.88) / 0.12
-      return { x: dropX, y: binY + t * (BIN_H * 0.5) }
-    }
-  }, [ballProgress, pipelineResult, selectedColIdx, holeXs, rulesBlockY, tierCount, thresholdY, sorterY, binY, sourceY])
+    return terminals.map((term, ci) => {
+      const isElimPool = eliminatedAfterPool.has(term.terminalId)
 
-  useEffect(() => {
-    if (ballProgress <= 0) trailRef.current = []
-    if (ballPos) trailRef.current = [...trailRef.current, `${ballPos.x},${ballPos.y}`]
-  }, [ballPos, ballProgress])
+      if (isElimPool) {
+        // Eliminated in pool — chip stays at start, faded, with X
+        return { x: holeXs[ci], y: chipsStartY + 20, state: 'eliminated-pool', opacity: 0.25 }
+      }
 
-  const trailPath = trailRef.current.length > 1 ? `M ${trailRef.current.join(' L ')}` : ''
-  const ballColor = txn.payment_method === 'UPI' ? '#16a34a' : txn.payment_method === 'NB' ? '#9333ea' : '#528FF0'
+      // Find at which rule this terminal gets ejected
+      let ejectedAtRule = -1
+      for (let ri = 0; ri < ruleStages.length; ri++) {
+        const wasElimBefore = ri > 0 ? eliminatedAtRule[ri - 1].has(term.terminalId) : eliminatedAfterPool.has(term.terminalId)
+        if (wasElimBefore) break
+        const isElimHere = (ruleStages[ri].terminalsEliminated || []).some(t => t.terminalId === term.terminalId)
+        if (isElimHere) { ejectedAtRule = ri; break }
+      }
 
-  // Hover state for holes
-  const [hoveredHole, setHoveredHole] = useState(null) // {ri, ci}
+      const isEliminated = eliminatedAfterRules.has(term.terminalId)
+
+      if (p < 0.08) {
+        // Chips lined up at the top, ready to enter pipe
+        const t = p / 0.08
+        const startX = PIPE_LEFT + 20 + ci * (CHIP_R * 2 + 6)
+        const startY = chipsStartY + 20
+        const enterY = pipeYAt(0, PIPE_LEFT) + PIPE_THICKNESS / 2
+        return { x: startX + t * (PIPE_LEFT + 10 - startX), y: startY + t * (enterY - startY), state: 'entering', opacity: 1 }
+      }
+
+      // Chip rolls through pipe tiers
+      const rollPhase = 0.08
+      const rollEnd = 0.65
+      const rollT = Math.min(Math.max((p - rollPhase) / (rollEnd - rollPhase), 0), 1)
+
+      if (ejectedAtRule >= 0) {
+        // This chip gets ejected at a specific rule
+        const ejectionPoint = (ejectedAtRule + 0.5) / tierCount
+        if (rollT < ejectionPoint) {
+          // Still rolling, hasn't reached ejection point
+          const localT = rollT / ejectionPoint
+          const tierIdx = Math.min(Math.floor(localT * tierCount), ejectedAtRule)
+          const x = PIPE_LEFT + localT * pipeW * 0.8
+          const y = pipeYAt(tierIdx, x) + PIPE_THICKNESS / 2
+          return { x, y, state: 'rolling', opacity: 1 }
+        } else {
+          // Ejected! Chip drops below the pipe
+          const ejectT = Math.min((rollT - ejectionPoint) / 0.15, 1)
+          const ejectX = holeXs[ci]
+          const ejectStartY = pipeYAt(ejectedAtRule, ejectX) + PIPE_THICKNESS
+          const ejectEndY = ejectStartY + EJECT_DROP
+          const easeT = ejectT * ejectT // gravity
+          return {
+            x: ejectX,
+            y: ejectStartY + easeT * (ejectEndY - ejectStartY),
+            state: 'ejected',
+            opacity: 0.5 + (1 - ejectT) * 0.5,
+            ejectedAtTier: ejectedAtRule,
+          }
+        }
+      }
+
+      // Surviving chip — rolls through all tiers
+      if (rollT < 1) {
+        const tierIdx = Math.min(Math.floor(rollT * tierCount), tierCount - 1)
+        const x = PIPE_LEFT + rollT * pipeW * 0.9
+        const y = pipeYAt(tierIdx, x) + PIPE_THICKNESS / 2
+        const bounce = Math.sin(rollT * Math.PI * 6) * 2
+        return { x, y: y + bounce, state: 'rolling', opacity: 1 }
+      }
+
+      // Post-filter: chip exits pipe and moves to sorter
+      const postT = Math.min(Math.max((p - rollEnd) / (0.85 - rollEnd), 0), 1)
+      if (postT < 1) {
+        const exitX = PIPE_RIGHT - 10
+        const exitY = pipeYAt(tierCount - 1, exitX) + PIPE_THICKNESS / 2
+        const targetY = sorterY + 30
+        return { x: exitX + postT * (holeXs[ci] - exitX), y: exitY + postT * (targetY - exitY), state: 'to-sorter', opacity: 1 }
+      }
+
+      // Sorter → rank: chip moves to its final ranked position
+      const rankT = Math.min(Math.max((p - 0.85) / 0.15, 0), 1)
+      const scoredIdx = scoredTerminals.findIndex(s => s.terminalId === term.terminalId)
+      const finalY = rankY + 14 + (scoredIdx >= 0 ? scoredIdx : 0) * (RANK_CHIP_H + 6) + RANK_CHIP_H / 2
+      const finalX = PIPE_LEFT + 100
+      const fromX = holeXs[ci]
+      const fromY = sorterY + 30
+      return { x: fromX + rankT * (finalX - fromX), y: fromY + rankT * (finalY - fromY), state: 'ranked', opacity: 1 }
+    })
+  }, [animProgress, pipelineResult, terminals, holeXs, eliminatedAfterPool, eliminatedAtRule, eliminatedAfterRules, ruleStages, tierCount, chipsStartY, sorterY, rankY, scoredTerminals])
+
+  // Hover
+  const [hoveredHole, setHoveredHole] = useState(null)
 
   return (
     <div className="pipeline-container">
@@ -189,99 +223,103 @@ export default function PipelineView({
       {pipelineResult && (
         <svg className="pipeline-svg" viewBox={`0 0 ${W} ${totalH}`} preserveAspectRatio="xMidYMid meet">
           <defs>
-            <filter id="ball-glow"><feGaussianBlur stdDeviation="3" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
-            <filter id="glow-selected"><feGaussianBlur stdDeviation="4" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
-            <filter id="hole-shadow"><feDropShadow dx="0" dy="1" stdDeviation="2" floodOpacity="0.3"/></filter>
-            <radialGradient id="hole-open-grad"><stop offset="0%" stopColor="#065f46"/><stop offset="100%" stopColor="#047857"/></radialGradient>
-            <radialGradient id="hole-closed-grad"><stop offset="0%" stopColor="#dc2626"/><stop offset="100%" stopColor="#b91c1c"/></radialGradient>
+            <filter id="chip-shadow"><feDropShadow dx="0" dy="1" stdDeviation="1.5" floodOpacity="0.25"/></filter>
+            <filter id="glow-rank1"><feDropShadow dx="0" dy="0" stdDeviation="4" floodColor="#3b82f6" floodOpacity="0.4"/></filter>
             <linearGradient id="pipe-grad" x1="0" y1="0" x2="0.3" y2="1">
-              <stop offset="0%" stopColor="#cbd5e1"/>
-              <stop offset="50%" stopColor="#94a3b8"/>
-              <stop offset="100%" stopColor="#64748b"/>
+              <stop offset="0%" stopColor="#cbd5e1"/><stop offset="50%" stopColor="#94a3b8"/><stop offset="100%" stopColor="#64748b"/>
             </linearGradient>
             <linearGradient id="pipe-shine" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="rgba(255,255,255,0.6)"/>
-              <stop offset="40%" stopColor="rgba(255,255,255,0.1)"/>
-              <stop offset="100%" stopColor="rgba(0,0,0,0.05)"/>
+              <stop offset="0%" stopColor="rgba(255,255,255,0.55)"/><stop offset="35%" stopColor="rgba(255,255,255,0.1)"/><stop offset="100%" stopColor="rgba(0,0,0,0.05)"/>
             </linearGradient>
           </defs>
 
-          {/* ════════ BALL SOURCE — top-left ════════ */}
-          <circle cx={PIPE_LEFT - 8} cy={sourceY + SOURCE_R} r={SOURCE_R}
-            fill="#dbeafe" stroke="#528FF0" strokeWidth="2.5"/>
-          <circle cx={PIPE_LEFT - 8} cy={sourceY + SOURCE_R} r={6}
-            fill="#528FF0" opacity="0.4"/>
-          <text x={PIPE_LEFT - 8} y={sourceY + 2} textAnchor="middle"
-            style={{ fontSize: '10px', fill: '#528FF0', fontWeight: 700 }}>Source</text>
+          {/* ════════ STAGE 1: INITIAL CHIP LINEUP ════════ */}
+          <text x={4} y={sourceY + 12} style={{ fontSize: '12px', fill: '#1A202C', fontWeight: 700 }}>Terminal Pool</text>
+          <text x={W - 6} y={sourceY + 12} textAnchor="end" style={{ fontSize: '10px', fill: '#94a3b8', fontWeight: 500 }}>
+            {poolStage ? `${poolStage.remainingCount} of ${poolStage.totalCount} eligible for ${txn.payment_method}` : ''}
+          </text>
 
-          {/* Chute line from source to first pipe */}
-          <path d={`M ${PIPE_LEFT - 8} ${sourceY + SOURCE_R * 2} Q ${PIPE_LEFT - 8} ${rulesBlockY - 5} ${PIPE_LEFT + 10} ${rulesBlockY + PIPE_THICKNESS / 2}`}
-            fill="none" stroke="#94a3b8" strokeWidth="2" strokeDasharray="4 3" opacity="0.5"/>
+          {/* Static chip labels at starting positions */}
+          {terminals.map((term, ci) => {
+            const x = PIPE_LEFT + 20 + ci * (CHIP_R * 2 + 6)
+            const isElim = eliminatedAfterPool.has(term.terminalId)
+            return (
+              <g key={`start-${ci}`}>
+                {/* Starting chip (static, before animation) */}
+                {animProgress < 0 && (
+                  <g>
+                    <circle cx={x} cy={chipsStartY + 20} r={CHIP_R}
+                      fill={term.color} opacity={isElim ? 0.3 : 0.9} filter="url(#chip-shadow)"/>
+                    <text x={x} y={chipsStartY + 24} textAnchor="middle"
+                      style={{ fontSize: '7px', fill: '#fff', fontWeight: 700 }}>
+                      {term.gatewayShort}
+                    </text>
+                    {isElim && (
+                      <g>
+                        <line x1={x - 6} y1={chipsStartY + 14} x2={x + 6} y2={chipsStartY + 26} stroke="#fff" strokeWidth="2" strokeLinecap="round"/>
+                        <line x1={x + 6} y1={chipsStartY + 14} x2={x - 6} y2={chipsStartY + 26} stroke="#fff" strokeWidth="2" strokeLinecap="round"/>
+                      </g>
+                    )}
+                  </g>
+                )}
+                <text x={x} y={chipsStartY + 40} textAnchor="middle"
+                  style={{ fontSize: '8px', fill: isElim ? '#cbd5e1' : '#64748b', fontWeight: 600, fontFamily: "'Menlo', monospace" }}>
+                  {term.displayId.length > 8 ? term.displayId.slice(-7) : term.displayId}
+                </text>
+              </g>
+            )
+          })}
 
-          {/* ════════ FILTERING STEPS — TILTED PIPES ════════ */}
-          <text x={4} y={rulesBlockY - 8} style={{ fontSize: '12px', fill: '#1A202C', fontWeight: 700 }}>Filtering Steps</text>
+          {/* ════════ STAGE 2: TILTED FILTER PIPES ════════ */}
+          <text x={4} y={pipeBlockY - 10} style={{ fontSize: '12px', fill: '#1A202C', fontWeight: 700 }}>Filtering Steps</text>
+          <text x={W - 6} y={pipeBlockY - 10} textAnchor="end" style={{ fontSize: '9px', fill: '#94a3b8', fontWeight: 500, fontStyle: 'italic' }}>
+            click holes to toggle rules
+          </text>
 
           {ruleStages.map((stage, ri) => {
-            const tierBaseY = rulesBlockY + ri * (tierTotalH + TIER_SPACING)
+            const tierBaseY = pipeBlockY + ri * tierFullH
             const isSkip = stage.type === 'rule_skip'
             const isDisabled = stage.type === 'rule_disabled'
             const isNTFCause = stage.type === 'rule_ntf'
             const prevElim = ri > 0 ? eliminatedAtRule[ri - 1] : eliminatedAfterPool
 
-            // Pipe start and end points (tilted)
-            const pipeStartX = PIPE_LEFT
-            const pipeStartY = tierBaseY
-            const pipeEndX = PIPE_RIGHT
-            const pipeEndY = tierBaseY + PIPE_SLOPE_DROP
+            const pStartX = PIPE_LEFT
+            const pStartY = tierBaseY
+            const pEndX = PIPE_RIGHT
+            const pEndY = tierBaseY + PIPE_SLOPE_DROP
 
             return (
               <g key={`tier-${ri}`}>
-                {/* Rule name */}
-                <text x={PIPE_LEFT - 12} y={tierBaseY + PIPE_THICKNESS / 2 + 4} textAnchor="end"
-                  style={{ fontSize: '10px', fill: isSkip ? '#A0AEC0' : isDisabled ? '#cbd5e1' : '#64748b', fontWeight: 600, textDecoration: isDisabled ? 'line-through' : 'none' }}>
+                {/* Rule label */}
+                <text x={PIPE_LEFT - 10} y={tierBaseY + PIPE_THICKNESS / 2 + 4} textAnchor="end"
+                  style={{ fontSize: '10px', fill: isSkip ? '#A0AEC0' : isDisabled ? '#cbd5e1' : '#475569', fontWeight: 600, textDecoration: isDisabled ? 'line-through' : 'none' }}>
                   {(stage.ruleName || '').length > 14 ? (stage.ruleName || '').slice(0, 14) + '..' : stage.ruleName}
                 </text>
 
-                {/* Tilted pipe — 3D-ish tube */}
-                <path
-                  d={`M ${pipeStartX} ${pipeStartY} L ${pipeEndX} ${pipeEndY} L ${pipeEndX} ${pipeEndY + PIPE_THICKNESS} L ${pipeStartX} ${pipeStartY + PIPE_THICKNESS} Z`}
+                {/* Tilted pipe body */}
+                <path d={`M ${pStartX} ${pStartY} L ${pEndX} ${pEndY} L ${pEndX} ${pEndY + PIPE_THICKNESS} L ${pStartX} ${pStartY + PIPE_THICKNESS} Z`}
                   fill={isSkip || isDisabled ? '#f1f5f9' : 'url(#pipe-grad)'}
-                  stroke={isNTFCause ? '#E74C3C' : isSkip ? '#e2e8f0' : '#64748b'}
-                  strokeWidth={isNTFCause ? 2 : 1}
-                  opacity={isDisabled ? 0.4 : 1}
-                />
-                {/* Pipe shine/highlight */}
-                <path
-                  d={`M ${pipeStartX + 2} ${pipeStartY + 2} L ${pipeEndX - 2} ${pipeEndY + 2} L ${pipeEndX - 2} ${pipeEndY + PIPE_THICKNESS * 0.35} L ${pipeStartX + 2} ${pipeStartY + PIPE_THICKNESS * 0.35} Z`}
-                  fill="url(#pipe-shine)" opacity={isDisabled ? 0.2 : 0.6} pointerEvents="none"
-                />
+                  stroke={isNTFCause ? '#ef4444' : isSkip ? '#e2e8f0' : '#64748b'}
+                  strokeWidth={isNTFCause ? 2 : 1} opacity={isDisabled ? 0.35 : 1}/>
+                {/* Pipe shine */}
+                <path d={`M ${pStartX + 2} ${pStartY + 2} L ${pEndX - 2} ${pEndY + 2} L ${pEndX - 2} ${pEndY + PIPE_THICKNESS * 0.3} L ${pStartX + 2} ${pStartY + PIPE_THICKNESS * 0.3} Z`}
+                  fill="url(#pipe-shine)" opacity={isDisabled ? 0.15 : 0.5} pointerEvents="none"/>
 
-                {/* ── HOLES at each terminal position ── */}
+                {/* Holes at each terminal position */}
                 {terminals.map((term, ci) => {
                   const hx = holeXs[ci]
-                  const hy = holeYOnPipe(ri, hx)
+                  const hy = pipeYAt(ri, hx) + PIPE_THICKNESS / 2
                   const wasElimBefore = prevElim.has(term.terminalId)
                   const isElimHere = (stage.terminalsEliminated || []).some(t => t.terminalId === term.terminalId)
-                  const isKeptHere = (stage.terminalsRemaining || []).some(t => t.terminalId === term.terminalId)
-
                   const holeClosed = isElimHere && !isDisabled && !isSkip
-                  const holeOpen = (isKeptHere && !isDisabled && !isSkip) || (!isElimHere && !wasElimBefore && !isSkip && !isDisabled)
                   const isHovered = hoveredHole?.ri === ri && hoveredHole?.ci === ci
 
-                  if (wasElimBefore) {
-                    // Already eliminated — tiny faded mark
+                  if (wasElimBefore || isSkip || isDisabled) {
                     return (
-                      <circle key={`hole-${ri}-${ci}`} cx={hx} cy={hy} r={5}
-                        fill="#cbd5e1" opacity="0.2"/>
-                    )
-                  }
-
-                  if (isSkip || isDisabled) {
-                    // Rule skipped/disabled — dashed circle
-                    return (
-                      <circle key={`hole-${ri}-${ci}`} cx={hx} cy={hy} r={HOLE_R * 0.7}
-                        fill="none" stroke="#cbd5e1" strokeWidth="1.5" strokeDasharray="3 2"
-                        opacity={isDisabled ? 0.3 : 0.5}/>
+                      <circle key={`hole-${ri}-${ci}`} cx={hx} cy={hy} r={6}
+                        fill={wasElimBefore ? '#94a3b8' : 'none'} stroke="#94a3b8" strokeWidth="1"
+                        strokeDasharray={isSkip || isDisabled ? '2 2' : 'none'}
+                        opacity={wasElimBefore ? 0.15 : 0.25}/>
                     )
                   }
 
@@ -290,54 +328,29 @@ export default function PipelineView({
                       style={{ cursor: 'pointer' }}
                       onClick={() => stage.ruleId && onToggleRule(stage.ruleId)}
                       onMouseEnter={() => setHoveredHole({ ri, ci })}
-                      onMouseLeave={() => setHoveredHole(null)}
-                    >
-                      {/* Click target — invisible larger circle */}
-                      <circle cx={hx} cy={hy} r={HOLE_R + 6} fill="transparent"/>
-
-                      {/* Hover ring */}
-                      {isHovered && (
-                        <circle cx={hx} cy={hy} r={HOLE_R + 4}
-                          fill="none" stroke={holeClosed ? '#fca5a5' : '#6ee7b7'} strokeWidth="2" opacity="0.6"/>
-                      )}
+                      onMouseLeave={() => setHoveredHole(null)}>
+                      <circle cx={hx} cy={hy} r={HOLE_R + 4} fill="transparent"/>
+                      {isHovered && <circle cx={hx} cy={hy} r={HOLE_R + 3} fill="none" stroke={holeClosed ? '#fca5a5' : '#6ee7b7'} strokeWidth="2.5" opacity="0.7"/>}
 
                       {holeClosed ? (
-                        /* ── CLOSED HOLE — red, sealed ── */
                         <g>
-                          <circle cx={hx} cy={hy} r={HOLE_R}
-                            fill="url(#hole-closed-grad)" filter="url(#hole-shadow)"/>
-                          {/* Metallic cross */}
-                          <line x1={hx - 7} y1={hy - 7} x2={hx + 7} y2={hy + 7}
-                            stroke="#fef2f2" strokeWidth="3" strokeLinecap="round"/>
-                          <line x1={hx + 7} y1={hy - 7} x2={hx - 7} y2={hy + 7}
-                            stroke="#fef2f2" strokeWidth="3" strokeLinecap="round"/>
-                          {/* Label */}
-                          <text x={hx} y={hy + HOLE_R + 12} textAnchor="middle"
-                            style={{ fontSize: '8px', fill: '#dc2626', fontWeight: 700 }}>BLOCKED</text>
+                          <circle cx={hx} cy={hy} r={HOLE_R} fill="#dc2626" stroke="#991b1b" strokeWidth="1.5" filter="url(#chip-shadow)"/>
+                          <line x1={hx - 6} y1={hy - 6} x2={hx + 6} y2={hy + 6} stroke="#fef2f2" strokeWidth="2.5" strokeLinecap="round"/>
+                          <line x1={hx + 6} y1={hy - 6} x2={hx - 6} y2={hy + 6} stroke="#fef2f2" strokeWidth="2.5" strokeLinecap="round"/>
                         </g>
                       ) : (
-                        /* ── OPEN HOLE — green/dark, passage ── */
                         <g>
-                          <circle cx={hx} cy={hy} r={HOLE_R}
-                            fill="url(#hole-open-grad)" filter="url(#hole-shadow)"/>
-                          {/* Inner dark hole */}
-                          <circle cx={hx} cy={hy} r={HOLE_R * 0.55}
-                            fill="#022c22" opacity="0.7"/>
-                          {/* Down arrow */}
-                          <path d={`M ${hx - 5} ${hy - 2} L ${hx} ${hy + 4} L ${hx + 5} ${hy - 2}`}
+                          <circle cx={hx} cy={hy} r={HOLE_R} fill="#065f46" stroke="#047857" strokeWidth="1.5" filter="url(#chip-shadow)"/>
+                          <circle cx={hx} cy={hy} r={HOLE_R * 0.5} fill="#022c22" opacity="0.6"/>
+                          <path d={`M ${hx - 4} ${hy - 1} L ${hx} ${hy + 4} L ${hx + 4} ${hy - 1}`}
                             fill="none" stroke="#a7f3d0" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                          {/* Label */}
-                          <text x={hx} y={hy + HOLE_R + 12} textAnchor="middle"
-                            style={{ fontSize: '8px', fill: '#047857', fontWeight: 700 }}>OPEN</text>
                         </g>
                       )}
 
-                      {/* Hover tooltip */}
                       {isHovered && (
                         <g>
-                          <rect x={hx - 50} y={hy - HOLE_R - 28} width={100} height={20} rx={4}
-                            fill="#1e293b" opacity="0.9"/>
-                          <text x={hx} y={hy - HOLE_R - 14} textAnchor="middle"
+                          <rect x={hx - 48} y={hy - HOLE_R - 26} width={96} height={18} rx={4} fill="#1e293b" opacity="0.9"/>
+                          <text x={hx} y={hy - HOLE_R - 13} textAnchor="middle"
                             style={{ fontSize: '9px', fill: '#fff', fontWeight: 600 }}>
                             Click to {holeClosed ? 'open' : 'close'}
                           </text>
@@ -346,205 +359,136 @@ export default function PipelineView({
                     </g>
                   )
                 })}
-              </g>
-            )
-          })}
 
-          {/* ── Terminal labels below pipes ── */}
-          {terminals.map((term, ci) => {
-            const hx = holeXs[ci]
-            const isElim = eliminatedAfterRules.has(term.terminalId)
-            return (
-              <g key={`tlabel-${ci}`}>
-                <text x={hx} y={termLabelY + 10} textAnchor="middle"
-                  style={{ fontSize: '10px', fill: isElim ? '#cbd5e1' : '#1A202C', fontWeight: 700, fontFamily: "'Menlo', monospace" }}>
-                  {term.displayId}
-                </text>
-                <text x={hx} y={termLabelY + 22} textAnchor="middle"
-                  style={{ fontSize: '9px', fill: isElim ? '#e2e8f0' : '#718096', fontWeight: 500 }}>
-                  {term.gatewayShort}
-                </text>
-              </g>
-            )
-          })}
-
-          {/* Drop lines from last pipe tier to threshold */}
-          {terminals.map((term, ci) => {
-            const hx = holeXs[ci]
-            const isElim = eliminatedAfterRules.has(term.terminalId)
-            const lastHoleY = holeYOnPipe(tierCount - 1, hx) + HOLE_R + 12
-            return (
-              <line key={`drop-${ci}`} x1={hx} y1={lastHoleY + 14} x2={hx} y2={thresholdY}
-                stroke={isElim ? '#f1f5f9' : '#cbd5e1'} strokeWidth="1" strokeDasharray="3 3"
-                opacity={isElim ? 0.2 : 0.4}/>
-            )
-          })}
-
-          {/* ════════ SR THRESHOLD ════════ */}
-          <text x={4} y={thresholdY + 4} style={{ fontSize: '12px', fill: '#1A202C', fontWeight: 700 }}>SR Threshold</text>
-          {(simOverrides.srThreshold > 0 || merchant.srThresholdLow > 0) && (
-            <text x={W - 6} y={thresholdY + 4} textAnchor="end" style={{ fontSize: '10px', fill: '#A0AEC0', fontWeight: 500 }}>
-              ≥ {simOverrides.srThreshold || merchant.srThresholdLow || 0}%
-            </text>
-          )}
-
-          {(() => {
-            const threshold = simOverrides.srThreshold || merchant.srThresholdLow || 0
-            const barY = thresholdY + 14
-            const barH = THRESHOLD_H - 24
-            const maxSR = Math.max(...terminals.map(t => t.successRate), 100)
-            const minSR = Math.min(...terminals.map(t => t.successRate), 0)
-            const range = maxSR - minSR + 10
-
-            return (
-              <g>
-                {terminals.map((term, ci) => {
-                  const cx = holeXs[ci]
-                  const barW = 22
-                  const isElimBefore = eliminatedAfterRules.has(term.terminalId)
-                  const isElimHere = thresholdStage?.terminalsEliminated?.some(t => t.terminalId === term.terminalId)
-                  const fillH = ((term.successRate - minSR + 5) / range) * barH
-
-                  if (isElimBefore) return <rect key={`thr-${ci}`} x={cx - barW / 2} y={barY} width={barW} height={barH} rx={3} fill="#f8fafc" opacity="0.3"/>
-
-                  return (
-                    <g key={`thr-${ci}`}>
-                      <rect x={cx - barW / 2} y={barY} width={barW} height={barH} rx={3} fill="#f1f5f9" stroke="#e2e8f0" strokeWidth="0.5"/>
-                      <rect x={cx - barW / 2} y={barY + barH - fillH} width={barW} height={fillH} rx={3}
-                        fill={isElimHere ? '#fca5a5' : '#6ee7b7'} opacity="0.8"/>
-                      <text x={cx} y={barY + barH + 12} textAnchor="middle"
-                        style={{ fontSize: '9px', fill: isElimHere ? '#dc2626' : '#718096', fontWeight: 600 }}>
-                        {term.successRate}%
-                      </text>
-                    </g>
-                  )
-                })}
-
-                {/* Threshold line */}
-                {threshold > 0 && (() => {
-                  const lineY = barY + barH - ((threshold - minSR + 5) / range) * barH
-                  return <line x1={PIPE_LEFT - 10} y1={lineY} x2={PIPE_RIGHT + 10} y2={lineY}
-                    stroke="#ef4444" strokeWidth="1.5" strokeDasharray="6 3" opacity="0.6"/>
-                })()}
-              </g>
-            )
-          })()}
-
-          {/* Drop lines threshold → sorter */}
-          {terminals.map((term, ci) => {
-            const hx = holeXs[ci]
-            const isElim = eliminatedAfterThreshold.has(term.terminalId)
-            return <line key={`drop2-${ci}`} x1={hx} y1={thresholdY + THRESHOLD_H} x2={hx} y2={sorterY}
-              stroke={isElim ? '#f1f5f9' : '#cbd5e1'} strokeWidth="1" strokeDasharray="3 3" opacity={isElim ? 0.2 : 0.4}/>
-          })}
-
-          {/* ════════ SORTER ════════ */}
-          <text x={4} y={sorterY + 4} style={{ fontSize: '12px', fill: '#1A202C', fontWeight: 700 }}>
-            Sorter {pipelineResult?.routingStrategy === 'cost_based' ? '(Cost)' : '(SR)'}
-          </text>
-
-          {terminals.map((term, ci) => {
-            const cx = holeXs[ci]
-            const isElim = eliminatedAfterThreshold.has(term.terminalId)
-            const scored = sorterStage?.scored?.find(s => s.terminalId === term.terminalId)
-            const maxScore = Math.max(...(sorterStage?.scored || []).map(s => s.finalScore), 1)
-            const score = scored?.finalScore || 0
-            const colW = pipeW / colCount
-            const funnelW = isElim ? 8 : 12 + (score / maxScore) * (colW * 0.65 - 12)
-            const fy = sorterY + 14
-            const fh = SORTER_H - 26
-
-            return (
-              <g key={`sort-${ci}`}>
-                <path d={`M ${cx - funnelW / 2} ${fy} L ${cx + funnelW / 2} ${fy} L ${cx + funnelW / 4} ${fy + fh} L ${cx - funnelW / 4} ${fy + fh} Z`}
-                  fill={isElim ? 'none' : scored?.isSelected ? '#dbeafe' : '#e0e7ff'}
-                  stroke={isElim ? '#e2e8f0' : scored?.isSelected ? '#528FF0' : '#93a8d2'}
-                  strokeWidth={scored?.isSelected ? 2 : 1}
-                  opacity={isElim ? 0.15 : 0.8}/>
-                {!isElim && scored && (
-                  <text x={cx} y={fy + fh + 12} textAnchor="middle"
-                    style={{ fontSize: '10px', fill: '#528FF0', fontWeight: 700 }}>{Math.round(score)}</text>
-                )}
-              </g>
-            )
-          })}
-
-          {/* Drop lines sorter → bins */}
-          {terminals.map((term, ci) => {
-            const hx = holeXs[ci]
-            const isElim = eliminatedAfterThreshold.has(term.terminalId)
-            return <line key={`drop3-${ci}`} x1={hx} y1={sorterY + SORTER_H} x2={hx} y2={binY}
-              stroke={isElim ? '#f1f5f9' : '#cbd5e1'} strokeWidth="1" strokeDasharray="3 3" opacity={isElim ? 0.2 : 0.4}/>
-          })}
-
-          {/* ════════ BINS ════════ */}
-          <text x={4} y={binY + 4} style={{ fontSize: '12px', fill: '#1A202C', fontWeight: 700 }}>
-            {isNTF ? 'Payment Failed' : 'Terminal Selected'}
-          </text>
-
-          {terminals.map((term, ci) => {
-            const cx = holeXs[ci]
-            const colW = pipeW / colCount
-            const bw = Math.min(colW - 10, 90)
-            const isSelected = term.terminalId === selectedTerminalId
-            const isElim = eliminatedAfterThreshold.has(term.terminalId)
-
-            return (
-              <g key={`bin-${ci}`}>
-                <rect x={cx - bw / 2} y={binY + 12} width={bw} height={BIN_H - 12} rx={8}
-                  fill={isSelected ? '#dbeafe' : isElim ? '#fafafa' : '#f8fafc'}
-                  stroke={isSelected ? '#528FF0' : isElim ? '#f1f5f9' : '#e2e8f0'}
-                  strokeWidth={isSelected ? 2.5 : 1}
-                  filter={isSelected ? 'url(#glow-selected)' : undefined}
-                  opacity={isElim ? 0.3 : 1}/>
-                <text x={cx} y={binY + 32} textAnchor="middle"
-                  style={{ fontSize: '11px', fill: isSelected ? '#1e40af' : isElim ? '#cbd5e1' : '#64748b', fontWeight: 700, fontFamily: "'Menlo', monospace" }}>
-                  {term.displayId}
-                </text>
-                <text x={cx} y={binY + 45} textAnchor="middle"
-                  style={{ fontSize: '9px', fill: isSelected ? '#528FF0' : isElim ? '#e2e8f0' : '#94a3b8', fontWeight: 500 }}>
-                  {term.gatewayShort}
-                </text>
-                {isSelected && (
-                  <text x={cx} y={binY + 58} textAnchor="middle"
-                    style={{ fontSize: '9px', fill: '#528FF0', fontWeight: 600 }}>
-                    SR {term.successRate}% · ₹{term.costPerTxn}
+                {/* Ejection zone label — shows ejected chip names */}
+                {(stage.terminalsEliminated || []).length > 0 && !isSkip && !isDisabled && (
+                  <text x={PIPE_RIGHT + 4} y={pEndY + PIPE_THICKNESS + EJECT_DROP + 4} textAnchor="start"
+                    style={{ fontSize: '8px', fill: '#ef4444', fontWeight: 500, fontStyle: 'italic' }}>
+                    ejected
                   </text>
                 )}
               </g>
             )
           })}
 
-          {isNTF && (
+          {/* ════════ STAGE 3: SORTER ════════ */}
+          <text x={4} y={sorterY + 4} style={{ fontSize: '12px', fill: '#1A202C', fontWeight: 700 }}>
+            Sorter — {pipelineResult?.routingStrategy === 'cost_based' ? 'Cost Optimized' : 'SR Optimized'}
+          </text>
+          <text x={W - 6} y={sorterY + 4} textAnchor="end" style={{ fontSize: '9px', fill: '#94a3b8', fontWeight: 500 }}>
+            {scoredTerminals.length} terminals scored & ranked
+          </text>
+
+          {/* Sorter visualization — converging funnel */}
+          <path d={`M ${PIPE_LEFT} ${sorterY + 16} L ${PIPE_RIGHT} ${sorterY + 16} L ${PIPE_LEFT + 200} ${sorterY + SORTER_H - 10} L ${PIPE_LEFT + 60} ${sorterY + SORTER_H - 10} Z`}
+            fill="#f0f4ff" stroke="#93a8d2" strokeWidth="1" opacity="0.5"/>
+          <path d={`M ${PIPE_LEFT + 2} ${sorterY + 18} L ${PIPE_RIGHT - 2} ${sorterY + 18} L ${PIPE_LEFT + 200} ${sorterY + 34} L ${PIPE_LEFT + 60} ${sorterY + 34} Z`}
+            fill="rgba(255,255,255,0.4)" pointerEvents="none"/>
+
+          {/* Score labels inside sorter */}
+          {scoredTerminals.map((scored, si) => {
+            const term = terminals.find(t => t.terminalId === scored.terminalId)
+            if (!term) return null
+            const x = PIPE_LEFT + 40 + si * ((PIPE_RIGHT - PIPE_LEFT - 80) / Math.max(scoredTerminals.length - 1, 1))
+            return (
+              <text key={`sscore-${si}`} x={x} y={sorterY + 50} textAnchor="middle"
+                style={{ fontSize: '9px', fill: '#528FF0', fontWeight: 600 }}>
+                {term.gatewayShort}: {Math.round(scored.finalScore)}
+              </text>
+            )
+          })}
+
+          {/* ════════ STAGE 4: RANKED OUTPUT ════════ */}
+          <text x={4} y={rankY + 4} style={{ fontSize: '12px', fill: '#1A202C', fontWeight: 700 }}>
+            {isNTF ? 'No Terminal Found — Payment Failed' : 'Ranked Terminals'}
+          </text>
+
+          {isNTF ? (
             <g>
-              <rect x={W / 2 - 80} y={binY + 16} width={160} height={BIN_H - 20} rx={8}
+              <rect x={PIPE_LEFT} y={rankY + 14} width={300} height={50} rx={10}
                 fill="#fef2f2" stroke="#ef4444" strokeWidth="2"/>
-              <text x={W / 2} y={binY + 38} textAnchor="middle"
-                style={{ fontSize: '12px', fill: '#dc2626', fontWeight: 700 }}>No Terminal Found</text>
-              <text x={W / 2} y={binY + 54} textAnchor="middle"
-                style={{ fontSize: '10px', fill: '#94a3b8', fontWeight: 500 }}>Payment Failed</text>
+              <text x={PIPE_LEFT + 150} y={rankY + 36} textAnchor="middle"
+                style={{ fontSize: '13px', fill: '#dc2626', fontWeight: 700 }}>All terminals eliminated</text>
+              <text x={PIPE_LEFT + 150} y={rankY + 52} textAnchor="middle"
+                style={{ fontSize: '10px', fill: '#94a3b8', fontWeight: 500 }}>Payment cannot be processed</text>
             </g>
+          ) : (
+            scoredTerminals.map((scored, si) => {
+              const term = terminals.find(t => t.terminalId === scored.terminalId)
+              if (!term) return null
+              const y = rankY + 14 + si * (RANK_CHIP_H + 6)
+              const isFirst = si === 0
+
+              return (
+                <g key={`rank-${si}`}>
+                  {/* Rank card */}
+                  <rect x={PIPE_LEFT} y={y} width={pipeW} height={RANK_CHIP_H} rx={8}
+                    fill={isFirst ? '#eff6ff' : '#fafafa'}
+                    stroke={isFirst ? '#528FF0' : '#e2e8f0'}
+                    strokeWidth={isFirst ? 2 : 1}
+                    filter={isFirst ? 'url(#glow-rank1)' : undefined}/>
+
+                  {/* Rank number */}
+                  <circle cx={PIPE_LEFT + 22} cy={y + RANK_CHIP_H / 2} r={12}
+                    fill={isFirst ? '#528FF0' : '#e2e8f0'}/>
+                  <text x={PIPE_LEFT + 22} y={y + RANK_CHIP_H / 2 + 4} textAnchor="middle"
+                    style={{ fontSize: '11px', fill: isFirst ? '#fff' : '#94a3b8', fontWeight: 700 }}>
+                    {si + 1}
+                  </text>
+
+                  {/* Terminal chip */}
+                  <circle cx={PIPE_LEFT + 52} cy={y + RANK_CHIP_H / 2} r={10}
+                    fill={term.color} filter="url(#chip-shadow)"/>
+
+                  {/* Terminal name */}
+                  <text x={PIPE_LEFT + 72} y={y + RANK_CHIP_H / 2 - 4} textAnchor="start"
+                    style={{ fontSize: '12px', fill: isFirst ? '#1e3a5f' : '#475569', fontWeight: 700, fontFamily: "'Menlo', monospace" }}>
+                    {term.displayId}
+                  </text>
+                  <text x={PIPE_LEFT + 72} y={y + RANK_CHIP_H / 2 + 10} textAnchor="start"
+                    style={{ fontSize: '10px', fill: '#94a3b8', fontWeight: 500 }}>
+                    {term.gatewayShort} · SR {scored.successRate}% · ₹{scored.costPerTxn} · Score: {Math.round(scored.finalScore)}
+                  </text>
+
+                  {/* Winner badge */}
+                  {isFirst && (
+                    <g>
+                      <rect x={PIPE_RIGHT - 80} y={y + 6} width={70} height={24} rx={12}
+                        fill="#528FF0"/>
+                      <text x={PIPE_RIGHT - 45} y={y + 22} textAnchor="middle"
+                        style={{ fontSize: '10px', fill: '#fff', fontWeight: 700 }}>SELECTED</text>
+                    </g>
+                  )}
+                </g>
+              )
+            })
           )}
 
-          {/* ════════ Trail ════════ */}
-          {trailPath && (
-            <path d={trailPath} fill="none" stroke={ballColor} strokeWidth="3" opacity="0.2"
-              strokeLinecap="round" strokeLinejoin="round"/>
-          )}
+          {/* ════════ ANIMATED CHIPS ════════ */}
+          {chipPositions && chipPositions.map((pos, ci) => {
+            if (!pos) return null
+            const term = terminals[ci]
+            const isEjected = pos.state === 'ejected' || pos.state === 'eliminated-pool'
 
-          {/* ════════ Ball ════════ */}
-          {ballPos && ballProgress >= 0 && ballProgress <= 1 && (
-            <g>
-              <circle cx={ballPos.x} cy={ballPos.y} r={9}
-                fill={isNTF && ballProgress > 0.7 ? '#ef4444' : ballColor}
-                filter="url(#ball-glow)"
-                opacity={ballProgress > 0.95 ? 0.3 : 1}/>
-              {/* Ball shine */}
-              <circle cx={ballPos.x - 2} cy={ballPos.y - 2} r={3}
-                fill="rgba(255,255,255,0.4)" pointerEvents="none"
-                opacity={ballProgress > 0.95 ? 0 : 1}/>
-            </g>
-          )}
+            return (
+              <g key={`achip-${ci}`} opacity={pos.opacity}>
+                <circle cx={pos.x} cy={pos.y} r={CHIP_R}
+                  fill={isEjected ? '#94a3b8' : term.color}
+                  stroke={isEjected ? '#64748b' : 'rgba(255,255,255,0.3)'}
+                  strokeWidth="1.5" filter="url(#chip-shadow)"/>
+                <text x={pos.x} y={pos.y + 4} textAnchor="middle"
+                  style={{ fontSize: '7px', fill: '#fff', fontWeight: 700, pointerEvents: 'none' }}>
+                  {term.gatewayShort}
+                </text>
+                {isEjected && (
+                  <g opacity="0.7">
+                    <line x1={pos.x - 5} y1={pos.y - 5} x2={pos.x + 5} y2={pos.y + 5} stroke="#fff" strokeWidth="1.5" strokeLinecap="round"/>
+                    <line x1={pos.x + 5} y1={pos.y - 5} x2={pos.x - 5} y2={pos.y + 5} stroke="#fff" strokeWidth="1.5" strokeLinecap="round"/>
+                  </g>
+                )}
+              </g>
+            )
+          })}
         </svg>
       )}
     </div>
