@@ -1,12 +1,14 @@
 import React, { useState, useMemo, useCallback } from 'react'
 import GaltonBoard from './GaltonBoard'
-import PipelineView from './PipelineView'
+import FilterDiagram from './FilterDiagram'
+import SortDiagram from './SortDiagram'
 import PaymentForm from './PaymentForm'
 import { merchants, gateways, generateSeedRules, simulateRoutingPipeline } from './data'
 
 export default function App() {
   const [selectedMerchantId, setSelectedMerchantId] = useState(merchants[0].id)
   const [mode, setMode] = useState('single') // 'single' | 'batch'
+  const [vizTab, setVizTab] = useState('filter') // 'filter' | 'sort'
   const merchant = merchants.find(m => m.id === selectedMerchantId)
   const rules = useMemo(() => merchant ? generateSeedRules(merchant) : [], [merchant])
 
@@ -17,7 +19,6 @@ export default function App() {
     routingStrategy: merchant?.routingStrategy || 'success_rate',
   })
 
-  // Single-payment transaction definition
   const [txn, setTxn] = useState({
     payment_method: 'Cards',
     amount: 5000,
@@ -26,9 +27,8 @@ export default function App() {
     international: false,
   })
 
-  // Pipeline result + animation state
   const [pipelineResult, setPipelineResult] = useState(null)
-  const [animKey, setAnimKey] = useState(0) // increment to restart animation
+  const [animKey, setAnimKey] = useState(0)
   const [activeStageIdx, setActiveStageIdx] = useState(-1)
 
   const handleMerchantChange = (e) => {
@@ -61,15 +61,6 @@ export default function App() {
     })
   }, [])
 
-  const handleToggleTerminal = useCallback((terminalId) => {
-    if (!terminalId) return
-    setSimOverrides(prev => {
-      const next = new Set(prev.disabledTerminals)
-      next.has(terminalId) ? next.delete(terminalId) : next.add(terminalId)
-      return { ...prev, disabledTerminals: next }
-    })
-  }, [])
-
   return (
     <div className="app">
       <header className="app-header">
@@ -80,17 +71,6 @@ export default function App() {
           <h1>Payment Routing Simulator</h1>
         </div>
         <div className="app-header-right">
-          <div className="mode-toggle">
-            <button className={`mode-btn${mode === 'single' ? ' active' : ''}`} onClick={() => setMode('single')}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4m-10-10h4m12 0h4"/></svg>
-              Single Payment
-            </button>
-            <button className={`mode-btn${mode === 'batch' ? ' active' : ''}`} onClick={() => setMode('batch')}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="7" cy="7" r="2"/><circle cx="17" cy="7" r="2"/><circle cx="12" cy="17" r="2"/><circle cx="7" cy="17" r="2"/><circle cx="17" cy="17" r="2"/></svg>
-              Batch
-            </button>
-          </div>
-          <div className="header-sep"></div>
           <select className="merchant-select" value={selectedMerchantId} onChange={handleMerchantChange}>
             {merchants.map(m => (
               <option key={m.id} value={m.id}>{m.name} — {m.gatewayMetrics.length} terminals</option>
@@ -100,43 +80,54 @@ export default function App() {
       </header>
 
       <div className="app-body">
-        {mode === 'single' ? (
-          <>
-            <PaymentForm
-              txn={txn}
-              setTxn={setTxn}
-              onSimulate={handleSimulate}
-              pipelineResult={pipelineResult}
-              activeStageIdx={activeStageIdx}
-              merchant={merchant}
-            />
-            <div className="app-pipeline-panel">
-              <PipelineView
-                key={selectedMerchantId}
+        <PaymentForm
+          txn={txn}
+          setTxn={setTxn}
+          onSimulate={handleSimulate}
+          pipelineResult={pipelineResult}
+          activeStageIdx={activeStageIdx}
+          merchant={merchant}
+        />
+
+        <div className="app-viz-panel">
+          {/* Tab bar */}
+          <div className="viz-tabs">
+            <button className={`viz-tab${vizTab === 'filter' ? ' active' : ''}`} onClick={() => setVizTab('filter')}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+              </svg>
+              Filter — NTF Check
+            </button>
+            <button className={`viz-tab${vizTab === 'sort' ? ' active' : ''}`} onClick={() => setVizTab('sort')}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/>
+              </svg>
+              Sort — Probability
+            </button>
+          </div>
+
+          {/* Diagram */}
+          <div className="viz-content">
+            {vizTab === 'filter' ? (
+              <FilterDiagram
                 merchant={merchant}
                 rules={rules}
                 txn={txn}
                 gateways={gateways}
                 simOverrides={simOverrides}
-                pipelineResult={pipelineResult}
-                animKey={animKey}
-                onStageReached={setActiveStageIdx}
                 onToggleRule={handleToggleRule}
-                onToggleTerminal={handleToggleTerminal}
               />
-            </div>
-          </>
-        ) : (
-          <div className="app-batch-panel">
-            <GaltonBoard
-              merchant={merchant}
-              rules={rules}
-              simOverrides={simOverrides}
-              setSimOverrides={setSimOverrides}
-              gateways={gateways}
-            />
+            ) : (
+              <SortDiagram
+                merchant={merchant}
+                rules={rules}
+                txn={txn}
+                gateways={gateways}
+                simOverrides={simOverrides}
+              />
+            )}
           </div>
-        )}
+        </div>
       </div>
     </div>
   )
