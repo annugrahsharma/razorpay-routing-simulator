@@ -46,11 +46,11 @@ export default function SortDiagram({ merchant, rules, txn, gateways, simOverrid
     return simulateRoutingPipeline(merchant, txn, rules, simOverrides)
   }, [merchant, txn, rules, simOverrides])
 
-  const scoredTerminals = simResult.stages?.find(s => s.type === 'sorter')?.scored || []
-  const eligibleTerminals = scoredTerminals.map(s => ({
+  const scoredTerminals = useMemo(() => simResult.stages?.find(s => s.type === 'sorter')?.scored || [], [simResult])
+  const eligibleTerminals = useMemo(() => scoredTerminals.map(s => ({
     ...s,
     ...terminals.find(t => t.terminalId === s.terminalId),
-  }))
+  })), [scoredTerminals, terminals])
 
   const colCount = eligibleTerminals.length
   if (colCount === 0) {
@@ -70,11 +70,15 @@ export default function SortDiagram({ merchant, rules, txn, gateways, simOverrid
   const binsLeft = (W - totalBinsW) / 2
 
   // Compute probability weights from scores
-  const totalScore = eligibleTerminals.reduce((s, t) => s + t.finalScore, 0)
-  const weights = eligibleTerminals.map(t => t.finalScore / totalScore)
+  const weights = useMemo(() => {
+    const totalScore = eligibleTerminals.reduce((s, t) => s + t.finalScore, 0)
+    if (totalScore === 0) return eligibleTerminals.map(() => 1 / Math.max(eligibleTerminals.length, 1))
+    return eligibleTerminals.map(t => t.finalScore / totalScore)
+  }, [eligibleTerminals])
 
   // Weighted random selection
-  const pickTerminal = (seed) => {
+  const pickTerminalRef = useRef(null)
+  pickTerminalRef.current = (seed) => {
     const r = (seed % 10000) / 10000
     let cumulative = 0
     for (let i = 0; i < weights.length; i++) {
@@ -109,7 +113,7 @@ export default function SortDiagram({ merchant, rules, txn, gateways, simOverrid
 
     for (let i = 0; i < BALL_COUNT; i++) {
       const seed = hashStr(`sort-${i}-${txn.payment_method}-${txn.amount}-${Date.now()}`)
-      const targetCol = pickTerminal(seed)
+      const targetCol = pickTerminalRef.current(seed)
       const tid = eligibleTerminals[targetCol].terminalId
       counts[tid] = (counts[tid] || 0) + 1
 
@@ -140,7 +144,7 @@ export default function SortDiagram({ merchant, rules, txn, gateways, simOverrid
       idx++
     }, 100)
     dropRef.current = interval
-  }, [isDropping, eligibleTerminals, weights, txn])
+  }, [isDropping, eligibleTerminals, txn])
 
   useEffect(() => {
     return () => { if (dropRef.current) clearInterval(dropRef.current) }
