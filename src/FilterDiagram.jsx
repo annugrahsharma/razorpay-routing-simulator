@@ -180,7 +180,7 @@ export default function FilterDiagram({ merchant, rules, txn, gateways, simOverr
       steps.push(`5% { transform: translate(${startX}px, ${startY + 15}px); opacity: 1; }`)
 
       // Peg bounces through the peg area
-      ball.jitters.forEach((j, ji) => {
+      ;(ball.jitters || []).forEach((j, ji) => {
         const pct = 10 + (ji / ball.jitters.length) * 50
         const progress = (ji + 1) / ball.jitters.length
         const x = startX + (targetX - startX) * progress * 0.8 + j

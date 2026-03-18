@@ -180,7 +180,7 @@ export default function SortDiagram({ merchant, rules, txn, gateways, simOverrid
       steps.push(`0% { transform: translate(${startX}px, ${funnelY + 10}px); opacity: 0; }`)
       steps.push(`5% { transform: translate(${startX}px, ${funnelY + 25}px); opacity: 1; }`)
 
-      ball.jitters.forEach((j, ji) => {
+      ;(ball.jitters || []).forEach((j, ji) => {
         const pct = 10 + (ji / ball.jitters.length) * 50
         const progress = (ji + 1) / ball.jitters.length
         const x = startX + (targetX - startX) * progress + j
